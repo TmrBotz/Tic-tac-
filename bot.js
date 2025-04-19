@@ -1,43 +1,36 @@
 const { Telegraf, Markup } = require('telegraf');
-const fs = require('fs');
 const express = require('express');
 
-const TOKEN = '7473136514:AAHaXM7b19fMf1MjYnz8lFc0mPBIAmO0FkM'; // Replace with your actual bot token
+const TOKEN = '7473136514:AAHaXM7b19fMf1MjYnz8lFc0mPBIAmO0FkM'; // Replace with your token
 const bot = new Telegraf(TOKEN);
 
-// Express web server for Render to ping
+// For Render
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Tic Tac Toe Bot is running!'));
+app.get('/', (req, res) => res.send('Tic Tac Toe Bot Running'));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-function getBoardPath(chatId) {
-    return `board_${chatId}.json`;
+const games = {}; // Active games
+const scores = {}; // { userId: { wins: 0 } }
+
+function initGame(chatId, player1, player2 = null) {
+    games[chatId] = {
+        board: Array(9).fill(""),
+        players: [player1],
+        invited: player2,
+        turn: 0
+    };
 }
 
-function resetBoard(chatId) {
-    const board = ["", "", "", "", "", "", "", "", ""];
-    fs.writeFileSync(getBoardPath(chatId), JSON.stringify(board));
+function getSymbol(turn) {
+    return turn === 0 ? "X" : "O";
 }
 
-function saveBoard(chatId, board) {
-    fs.writeFileSync(getBoardPath(chatId), JSON.stringify(board));
-}
-
-function loadBoard(chatId) {
-    const path = getBoardPath(chatId);
-    if (fs.existsSync(path)) {
-        return JSON.parse(fs.readFileSync(path));
-    }
-    return ["", "", "", "", "", "", "", "", ""];
-}
-
-function generateKeyboard(board) {
-    const buttons = board.map((val, idx) => Markup.button.callback(val || '.', String(idx)));
+function generateBoardMarkup(board) {
     return Markup.inlineKeyboard([
-        buttons.slice(0, 3),
-        buttons.slice(3, 6),
-        buttons.slice(6, 9)
+        [0, 1, 2].map(i => Markup.button.callback(board[i] || ".", String(i))),
+        [3, 4, 5].map(i => Markup.button.callback(board[i] || ".", String(i))),
+        [6, 7, 8].map(i => Markup.button.callback(board[i] || ".", String(i)))
     ]);
 }
 
@@ -50,84 +43,129 @@ function checkWinner(board, player) {
     return wins.some(combo => combo.every(i => board[i] === player));
 }
 
-function isBoardFull(board) {
+function isDraw(board) {
     return board.every(cell => cell !== "");
 }
 
-function findWinningMove(board, player) {
-    const wins = [
-        [0,1,2], [3,4,5], [6,7,8],
-        [0,3,6], [1,4,7], [2,5,8],
-        [0,4,8], [2,4,6]
-    ];
-    for (const combo of wins) {
-        const playerCount = combo.filter(i => board[i] === player).length;
-        const emptyIndex = combo.find(i => board[i] === "");
-        if (playerCount === 2 && emptyIndex !== undefined) return emptyIndex;
-    }
-    return null;
+function updateScore(userId) {
+    if (!scores[userId]) scores[userId] = { wins: 0 };
+    scores[userId].wins += 1;
 }
 
-function botMove(board) {
-    let move = findWinningMove(board, "O");
-    if (move !== null) return board[move] = "O";
-
-    move = findWinningMove(board, "X");
-    if (move !== null) return board[move] = "O";
-
-    if (board[4] === "") return board[4] = "O";
-
-    for (const i of [0,2,6,8]) if (board[i] === "") return board[i] = "O";
-    for (const i of [1,3,5,7]) if (board[i] === "") return board[i] = "O";
+function getScoreText(player1, player2) {
+    const score1 = scores[player1]?.wins || 0;
+    const score2 = scores[player2]?.wins || 0;
+    return `Score:\nPlayer X: ${score1} wins\nPlayer O: ${score2} wins`;
 }
 
-bot.start(ctx => {
+// Start game (public or private)
+bot.command("tictactoe", ctx => {
     const chatId = ctx.chat.id;
-    resetBoard(chatId);
-    ctx.reply("Let's play Tic Tac Toe! You are X, bot is O.", generateKeyboard(loadBoard(chatId)));
+    const userId = ctx.from.id;
+    const mentionedUser = ctx.message.entities?.find(e => e.type === 'mention');
+    const targetUsername = ctx.message.text.split(' ')[1];
+
+    if (games[chatId]) {
+        return ctx.reply("A game is already in progress. Use /leavegame to cancel it.");
+    }
+
+    let invitedId = null;
+    if (targetUsername?.startsWith('@')) {
+        invitedId = targetUsername; // store username (we will match later)
+    }
+
+    initGame(chatId, userId, invitedId);
+    ctx.reply(`Game created! ${invitedId ? `Waiting for ${invitedId} to join.` : 'Waiting for second player.'}`, Markup.inlineKeyboard([
+        [Markup.button.callback("Join Game", "join_game")],
+        [Markup.button.callback("Leave Game", "leave_game")]
+    ]));
 });
 
+// Join Game
+bot.action("join_game", async ctx => {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+    const username = `@${ctx.from.username}`;
+    const game = games[chatId];
+
+    if (!game) return ctx.answerCbQuery("No game found.");
+    if (game.players.length >= 2) return ctx.answerCbQuery("Game already has 2 players.");
+    if (game.players.includes(userId)) return ctx.answerCbQuery("You're already in.");
+    if (game.invited && game.invited !== username) return ctx.answerCbQuery("Only the invited user can join.");
+
+    game.players.push(userId);
+    await ctx.editMessageText("Game started! Player X and O are ready.");
+    await ctx.telegram.sendMessage(chatId, `Player X's turn`, generateBoardMarkup(game.board));
+});
+
+// Leave Game
+bot.action("leave_game", async ctx => {
+    const chatId = ctx.chat.id;
+    const userId = ctx.from.id;
+
+    const game = games[chatId];
+    if (!game) return ctx.answerCbQuery("No active game.");
+
+    if (game.players.includes(userId)) {
+        delete games[chatId];
+        await ctx.editMessageText("Game cancelled by a player.");
+    } else {
+        ctx.answerCbQuery("You're not part of this game.");
+    }
+});
+
+// Game moves
 bot.on('callback_query', async ctx => {
     const chatId = ctx.chat.id;
-    const board = loadBoard(chatId);
-    const index = parseInt(ctx.callbackQuery.data);
+    const userId = ctx.from.id;
+    const data = ctx.callbackQuery.data;
 
-    if (board[index] !== "") {
-        await ctx.answerCbQuery("Already taken!");
+    if (["join_game", "leave_game", "play_again"].includes(data)) return;
+
+    const game = games[chatId];
+    if (!game || game.players.length < 2) return;
+
+    const { board, players, turn } = game;
+    const index = parseInt(data);
+
+    if (userId !== players[turn]) return ctx.answerCbQuery("Not your turn!");
+    if (board[index] !== "") return ctx.answerCbQuery("Already taken!");
+
+    const symbol = getSymbol(turn);
+    board[index] = symbol;
+
+    if (checkWinner(board, symbol)) {
+        updateScore(players[turn]);
+        await ctx.editMessageText(`Player ${symbol} wins!\n\n${getScoreText(players[0], players[1])}`, Markup.inlineKeyboard([
+            [Markup.button.callback("Play Again", "play_again")]
+        ]));
         return;
     }
 
-    board[index] = "X";
-
-    if (checkWinner(board, "X")) {
-        await ctx.editMessageText("You win!");
-        resetBoard(chatId);
+    if (isDraw(board)) {
+        await ctx.editMessageText(`It's a draw!\n\n${getScoreText(players[0], players[1])}`, Markup.inlineKeyboard([
+            [Markup.button.callback("Play Again", "play_again")]
+        ]));
         return;
     }
 
-    if (isBoardFull(board)) {
-        await ctx.editMessageText("It's a draw!");
-        resetBoard(chatId);
-        return;
-    }
-
-    botMove(board);
-
-    if (checkWinner(board, "O")) {
-        await ctx.editMessageText("Bot wins!");
-        resetBoard(chatId);
-        return;
-    }
-
-    if (isBoardFull(board)) {
-        await ctx.editMessageText("It's a draw!");
-        resetBoard(chatId);
-        return;
-    }
-
-    saveBoard(chatId, board);
-    await ctx.editMessageText("Tic Tac Toe", generateKeyboard(board));
+    game.turn = 1 - turn;
+    await ctx.editMessageText(`Player ${getSymbol(game.turn)}'s turn`, generateBoardMarkup(board));
 });
 
-// Launch the bot
+// Play Again
+bot.action("play_again", async ctx => {
+    const chatId = ctx.chat.id;
+    const game = games[chatId];
+
+    if (!game || game.players.length < 2) {
+        return ctx.answerCbQuery("Cannot restart. No previous game found.");
+    }
+
+    game.board = Array(9).fill("");
+    game.turn = 0;
+
+    await ctx.editMessageText(`New Game! Player X's turn`, generateBoardMarkup(game.board));
+});
+
 bot.launch();
