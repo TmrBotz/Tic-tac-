@@ -1,14 +1,55 @@
 const { Telegraf, Markup } = require("telegraf");
-const fs = require("fs");
 
 const bot = new Telegraf("7473136514:AAHo9JfF8Be1qLmbrCiopjT5WhpWxBQABCU");
 
-// Games will be stored as: { "player1_player2": { board, turn, players } }
 const games = {};
+const pendingGames = {};
 
-bot.start((ctx) => {
+function getGameId(chatId, p1, p2) {
+  return `${chatId}_${[p1, p2].sort().join("_")}`;
+}
+
+function generateBoard(gameId) {
+  const game = games[gameId];
+  const { board } = game;
+
+  const buttons = [];
+  for (let i = 0; i < 3; i++) {
+    const row = [];
+    for (let j = 0; j < 3; j++) {
+      const index = i * 3 + j;
+      row.push(
+        Markup.button.callback(
+          board[index] || ".",
+          `${gameId}_${index}`
+        )
+      );
+    }
+    buttons.push(row);
+  }
+
+  return Markup.inlineKeyboard(buttons);
+}
+
+function checkWinner(board, symbol) {
+  const winPatterns = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8], // rows
+    [0, 3, 6], [1, 4, 7], [2, 5, 8], // cols
+    [0, 4, 8], [2, 4, 6]             // diagonals
+  ];
+
+  return winPatterns.some(pattern =>
+    pattern.every(index => board[index] === symbol)
+  );
+}
+
+function isDraw(board) {
+  return board.every(cell => cell !== "");
+}
+
+bot.command("start", (ctx) => {
   ctx.reply(
-    `<b>Welcome to Tic Tac Toe Bot!</b>\n\nUse <code>/tictactoe</code> to start a new game in group.`,
+    `<b>Welcome to Tic Tac Toe Bot!</b>\n\nUse /tictactoe in a group to start a game.`,
     { parse_mode: "HTML" }
   );
 });
@@ -18,43 +59,47 @@ bot.command("tictactoe", (ctx) => {
     return ctx.reply("This command only works in groups.");
   }
 
+  const chatId = ctx.chat.id;
   const player1 = ctx.from;
-  const msg = `<b>${player1.first_name}</b> wants to play Tic Tac Toe!\nClick below to join the game.`;
 
-  ctx.reply(msg, {
-    parse_mode: "HTML",
-    reply_markup: Markup.inlineKeyboard([
-      Markup.button.callback("Join Game", `join_${player1.id}`),
-    ]),
-  });
+  pendingGames[chatId] = player1.id;
+
+  ctx.reply(
+    `<b>${player1.first_name}</b> wants to play Tic Tac Toe!\nClick below to join the game.`,
+    {
+      parse_mode: "HTML",
+      reply_markup: Markup.inlineKeyboard([
+        Markup.button.callback("Join Game", `join_${chatId}_${player1.id}`)
+      ])
+    }
+  );
 });
 
-bot.action(/^join_(\d+)/, async (ctx) => {
-  const player1_id = ctx.match[1];
+bot.action(/^join_(\-?\d+)_(\d+)/, async (ctx) => {
+  const [_, chatId, player1Id] = ctx.match;
   const player2 = ctx.from;
-  const player2_id = player2.id;
 
-  if (player1_id == player2_id) {
+  if (player2.id == player1Id) {
     return ctx.answerCbQuery("You can't join your own game.");
   }
 
-  const gameId = getGameId(player1_id, player2_id);
+  const gameId = getGameId(chatId, player1Id, player2.id);
 
   if (games[gameId]) {
-    return ctx.answerCbQuery("Game already started!");
+    return ctx.answerCbQuery("Game already in progress!");
   }
 
   games[gameId] = {
-    board: ["", "", "", "", "", "", "", "", ""],
+    board: Array(9).fill(""),
     players: {
-      X: parseInt(player1_id),
-      O: parseInt(player2_id),
+      X: parseInt(player1Id),
+      O: player2.id,
     },
     turn: "X",
   };
 
   await ctx.editMessageText(
-    `<b>Game Started!</b>\n\n<b>X:</b> <a href="tg://user?id=${player1_id}">Player 1</a>\n<b>O:</b> <a href="tg://user?id=${player2_id}">Player 2</a>\n\n<b>X's Turn</b>`,
+    `<b>Game Started!</b>\n\n<b>X:</b> <a href="tg://user?id=${player1Id}">Player 1</a>\n<b>O:</b> <a href="tg://user?id=${player2.id}">Player 2</a>\n\n<b>X's Turn</b>`,
     {
       parse_mode: "HTML",
       reply_markup: generateBoard(gameId),
@@ -62,47 +107,39 @@ bot.action(/^join_(\d+)/, async (ctx) => {
   );
 });
 
-bot.action(/^[0-8]_[XO]+$/, async (ctx) => {
-  const [cell, symbol] = ctx.match[0].split("_");
-  const userId = ctx.from.id;
+bot.on("callback_query", async (ctx) => {
+  const data = ctx.callbackQuery.data;
 
-  // Find the correct game
-  const gameId = Object.keys(games).find((id) => {
-    const game = games[id];
-    return game.players[game.turn] === userId && game.turn === symbol;
-  });
+  if (!data.includes("_")) return;
 
-  if (!gameId) return ctx.answerCbQuery("It's not your turn!");
+  const parts = data.split("_");
+  const chatId = ctx.chat.id;
+  const gameId = `${parts[0]}_${parts[1]}_${parts[2]}`;
+  const index = parseInt(parts[3]);
 
   const game = games[gameId];
-  const board = game.board;
+  if (!game) return ctx.answerCbQuery("Game not found!");
 
-  if (board[cell] !== "") {
-    return ctx.answerCbQuery("This cell is already taken.");
-  }
+  const playerId = ctx.from.id;
+  const symbol = Object.entries(game.players).find(([s, id]) => id === playerId)?.[0];
 
-  board[cell] = symbol;
+  if (!symbol) return ctx.answerCbQuery("You're not part of this game.");
+  if (game.players[game.turn] !== playerId) return ctx.answerCbQuery("It's not your turn.");
+  if (game.board[index]) return ctx.answerCbQuery("Cell already taken.");
 
-  const winner = checkWinner(board);
-  const draw = board.every((c) => c !== "");
+  game.board[index] = symbol;
 
-  if (winner) {
+  if (checkWinner(game.board, symbol)) {
     await ctx.editMessageText(
-      `<b>Game Over!</b>\n\n<b>Winner:</b> <a href="tg://user?id=${game.players[winner]}">${winner}</a>`,
-      {
-        parse_mode: "HTML",
-        reply_markup: generateBoard(gameId, true),
-      }
+      `<b>${symbol} wins!</b>`,
+      { parse_mode: "HTML" }
     );
     delete games[gameId];
     return;
   }
 
-  if (draw) {
-    await ctx.editMessageText(`<b>It's a Draw!</b>`, {
-      parse_mode: "HTML",
-      reply_markup: generateBoard(gameId, true),
-    });
+  if (isDraw(game.board)) {
+    await ctx.editMessageText(`<b>It's a draw!</b>`, { parse_mode: "HTML" });
     delete games[gameId];
     return;
   }
@@ -117,48 +154,5 @@ bot.action(/^[0-8]_[XO]+$/, async (ctx) => {
     }
   );
 });
-
-// Helpers
-
-function getGameId(p1, p2) {
-  return [p1, p2].sort().join("_");
-}
-
-function generateBoard(gameId, disabled = false) {
-  const game = games[gameId];
-  const { board, turn } = game;
-  const buttons = [];
-
-  for (let row = 0; row < 3; row++) {
-    const btnRow = [];
-    for (let col = 0; col < 3; col++) {
-      const i = row * 3 + col;
-      const text = board[i] || "·";
-      if (disabled || board[i] !== "") {
-        btnRow.push(Markup.button.callback(text, "disabled"));
-      } else {
-        btnRow.push(Markup.button.callback(text, `${i}_${turn}`));
-      }
-    }
-    buttons.push(btnRow);
-  }
-
-  return Markup.inlineKeyboard(buttons);
-}
-
-function checkWinner(b) {
-  const wins = [
-    [0, 1, 2], [3, 4, 5], [6, 7, 8],
-    [0, 3, 6], [1, 4, 7], [2, 5, 8],
-    [0, 4, 8], [2, 4, 6],
-  ];
-
-  for (const [a, b1, c] of wins) {
-    if (b[a] && b[a] === b[b1] && b[a] === b[c]) {
-      return b[a];
-    }
-  }
-  return null;
-}
 
 bot.launch();
