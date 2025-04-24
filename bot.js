@@ -10,27 +10,30 @@ const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Tic Tac Toe Bot Running'));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-// Game store - separate game per group chat
-const games = {}; // chatId => game object
+// Games data structure: chatId => { gameId => game }
+const games = {}; // group games
 
-function initGame(chatId, player1) {
-    games[chatId] = {
+function initGame(chatId, player1Id) {
+    if (!games[chatId]) games[chatId] = {};
+    const gameId = `wait_${player1Id}`;
+    games[chatId][gameId] = {
         board: Array(9).fill(""),
-        players: [player1],
+        players: [player1Id],
         names: {},
         turn: 0
     };
+    return gameId;
 }
 
 function getSymbol(turn) {
     return turn === 0 ? "X" : "O";
 }
 
-function generateBoardMarkup(board) {
+function generateBoardMarkup(board, chatId, gameId) {
     return Markup.inlineKeyboard([
-        [0, 1, 2].map(i => Markup.button.callback(board[i] || ".", String(i))),
-        [3, 4, 5].map(i => Markup.button.callback(board[i] || ".", String(i))),
-        [6, 7, 8].map(i => Markup.button.callback(board[i] || ".", String(i)))
+        [0, 1, 2].map(i => Markup.button.callback(board[i] || ".", `${chatId}_${gameId}_${i}`)),
+        [3, 4, 5].map(i => Markup.button.callback(board[i] || ".", `${chatId}_${gameId}_${i}`)),
+        [6, 7, 8].map(i => Markup.button.callback(board[i] || ".", `${chatId}_${gameId}_${i}`))
     ]);
 }
 
@@ -47,7 +50,6 @@ function isDraw(board) {
     return board.every(cell => cell !== "");
 }
 
-// /start command
 bot.start(ctx => {
     const name = ctx.from.first_name;
     ctx.replyWithHTML(
@@ -57,7 +59,6 @@ bot.start(ctx => {
     );
 });
 
-// Only works in group
 bot.command("tictactoe", ctx => {
     const chat = ctx.chat;
     const user = ctx.from;
@@ -69,38 +70,45 @@ bot.command("tictactoe", ctx => {
     const chatId = chat.id;
     const userId = user.id;
 
+    // Check if user already has a waiting game
     if (games[chatId]) {
-        return ctx.reply("⚠️ A game is already in progress in this group.");
+        const hasGame = Object.keys(games[chatId]).find(id => id.startsWith("wait_") && games[chatId][id].players[0] === userId);
+        if (hasGame) {
+            return ctx.reply("⚠️ You already started a game. Wait for another player to join.");
+        }
     }
 
-    initGame(chatId, userId);
-    games[chatId].names[userId] = user.first_name;
+    const gameId = initGame(chatId, userId);
+    games[chatId][gameId].names[userId] = user.first_name;
 
     ctx.replyWithHTML(
         `<b>Game Created!</b>\n\n` +
         `Player <b>X</b>: ${user.first_name}\n\n` +
         `Waiting for <b>Player O</b> to join...`,
-        Markup.inlineKeyboard([[Markup.button.callback("▶️ Join Game", `join_${chatId}`)]])
+        Markup.inlineKeyboard([[Markup.button.callback("▶️ Join Game", `join_${chatId}_${userId}`)]])
     );
 });
 
-// Join game
-bot.action(/^join_(.+)/, async ctx => {
-    const chatId = parseInt(ctx.match[1]);
+// Handle join
+bot.action(/^join_(.+)_(.+)/, async ctx => {
+    const [chatId, player1Id] = ctx.match.slice(1);
     const user = ctx.from;
     const userId = user.id;
-    const game = games[chatId];
 
-    if (!game) return ctx.answerCbQuery("No game found.");
-    if (game.players.length >= 2) return ctx.answerCbQuery("Game is already full.");
+    const gameId = `wait_${player1Id}`;
+    const game = games[chatId]?.[gameId];
+    if (!game) return ctx.answerCbQuery("Game not found.");
     if (game.players.includes(userId)) return ctx.answerCbQuery("You already joined.");
+    if (game.players.length >= 2) return ctx.answerCbQuery("Game is already full.");
 
-    game.players.push(userId);
-    game.names[userId] = user.first_name;
+    const newGameId = `${player1Id}_${userId}`;
+    games[chatId][newGameId] = { ...game, players: [parseInt(player1Id), userId], names: { ...game.names, [userId]: user.first_name } };
+    delete games[chatId][gameId];
 
-    const [p1, p2] = game.players;
-    const nameX = game.names[p1];
-    const nameO = game.names[p2];
+    const g = games[chatId][newGameId];
+    const [p1, p2] = g.players;
+    const nameX = g.names[p1];
+    const nameO = g.names[p2];
 
     await ctx.editMessageText(
         `<b>Game Started!</b>\n\n` +
@@ -113,58 +121,58 @@ bot.action(/^join_(.+)/, async ctx => {
     await ctx.telegram.sendMessage(
         chatId,
         `It's <b>${nameX}</b>'s turn (X)`,
-        { parse_mode: "HTML", reply_markup: generateBoardMarkup(game.board).reply_markup }
+        {
+            parse_mode: "HTML",
+            reply_markup: generateBoardMarkup(g.board, chatId, newGameId).reply_markup
+        }
     );
 });
 
-// Board clicks
+// Handle moves
 bot.on('callback_query', async ctx => {
-    const chatId = ctx.chat?.id || ctx.callbackQuery.message.chat.id;
-    const userId = ctx.from.id;
     const data = ctx.callbackQuery.data;
 
-    // Skip join actions
-    if (data.startsWith("join_")) return;
+    if (data.startsWith("join_")) return; // Already handled above
 
-    const game = games[chatId];
-    if (!game || game.players.length < 2) return ctx.answerCbQuery("No active game.");
+    const [chatId, gameId, cellIndex] = data.split("_");
+    const game = games[chatId]?.[gameId];
+    if (!game) return ctx.answerCbQuery("Game not found.");
 
-    const index = parseInt(data);
-    const { board, players, names, turn } = game;
+    const index = parseInt(cellIndex);
+    const userId = ctx.from.id;
 
-    if (userId !== players[turn]) return ctx.answerCbQuery("Not your turn!");
-    if (board[index] !== "") return ctx.answerCbQuery("Already taken!");
+    if (userId !== game.players[game.turn]) return ctx.answerCbQuery("Not your turn!");
+    if (game.board[index] !== "") return ctx.answerCbQuery("Already taken!");
 
-    const symbol = getSymbol(turn);
-    board[index] = symbol;
+    const symbol = getSymbol(game.turn);
+    game.board[index] = symbol;
 
-    if (checkWinner(board, symbol)) {
+    if (checkWinner(game.board, symbol)) {
         await ctx.editMessageText(
-            `<b>Player ${symbol} (${names[userId]}) wins!</b>`,
+            `<b>Player ${symbol} (${game.names[userId]}) wins!</b>`,
             { parse_mode: "HTML" }
         );
-        delete games[chatId];
+        delete games[chatId][gameId];
         return;
     }
 
-    if (isDraw(board)) {
+    if (isDraw(game.board)) {
         await ctx.editMessageText(`<b>It's a draw!</b>`, { parse_mode: "HTML" });
-        delete games[chatId];
+        delete games[chatId][gameId];
         return;
     }
 
-    game.turn = 1 - turn;
-    const nextPlayerId = players[game.turn];
-    const nextName = names[nextPlayerId];
+    game.turn = 1 - game.turn;
+    const nextPlayerId = game.players[game.turn];
+    const nextName = game.names[nextPlayerId];
 
     await ctx.editMessageText(
         `It's <b>${nextName}</b>'s turn (${getSymbol(game.turn)})`,
         {
             parse_mode: "HTML",
-            reply_markup: generateBoardMarkup(board).reply_markup
+            reply_markup: generateBoardMarkup(game.board, chatId, gameId).reply_markup
         }
     );
 });
 
-// Launch
 bot.launch();
