@@ -1,14 +1,16 @@
 {
-  "name": "tictactoe-telegram-bot",
-  "version": "1.0.0",
-  "description": "Telegram Tic Tac Toe Bot with private games and score tracking",
-  "main": "bot.js",
+  "name": "multi-tictactoe-bot",
+  "version": "2.0.0",
+  "description": "Telegram bot for multiple concurrent Tic Tac Toe games",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.12.2",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "axios": "^1.6.2",
+    "uuid": "^9.0.1"
   },
   "engines": {
     "node": ">=16.0.0"
