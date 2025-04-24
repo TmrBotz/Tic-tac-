@@ -1,279 +1,316 @@
-const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 
-const TOKEN = '7473136514:AAHo9JfF8Be1qLmbrCiopjT5WhpWxBQABCU';
-const bot = new Telegraf(TOKEN);
-
-// Express server for Render
 const app = express();
+app.use(bodyParser.json());
+
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Tic Tac Toe Bot Running'));
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// Games data structure: chatId => { gameId => game }
-const games = {};
+// Game storage
+const activeGames = new Map(); // gameId -> game
+const chatGames = new Map();   // chatId -> Set of gameIds
 
-function initGame(chatId, player1Id) {
-    const chatKey = String(chatId);
-    if (!games[chatKey]) games[chatKey] = {};
-    const gameId = `game_${Date.now()}_${player1Id}`; // More unique ID with timestamp
-    games[chatKey][gameId] = {
-        board: Array(9).fill(""),
-        players: [player1Id],
-        names: {},
-        turn: 0,
-        messageId: null,
-        createdAt: Date.now()
-    };
-    return gameId;
-}
-
-function getSymbol(turn) {
-    return turn === 0 ? "X" : "O";
-}
-
-function generateBoardMarkup(board, chatId, gameId) {
-    return Markup.inlineKeyboard([
-        [0, 1, 2].map(i => Markup.button.callback(board[i] || " ", `move_${chatId}_${gameId}_${i}`)),
-        [3, 4, 5].map(i => Markup.button.callback(board[i] || " ", `move_${chatId}_${gameId}_${i}`)),
-        [6, 7, 8].map(i => Markup.button.callback(board[i] || " ", `move_${chatId}_${gameId}_${i}`))
-    ]);
-}
-
-function checkWinner(board, player) {
-    const wins = [
-        [0,1,2], [3,4,5], [6,7,8],
-        [0,3,6], [1,4,7], [2,5,8],
-        [0,4,8], [2,4,6]
-    ];
-    return wins.some(combo => combo.every(i => board[i] === player));
-}
-
-function isDraw(board) {
-    return board.every(cell => cell !== "");
-}
-
-bot.start(ctx => {
-    const name = ctx.from.first_name;
-    ctx.replyWithHTML(
-        `<b>Welcome ${name}!</b>\n\n` +
-        `This is a 2-player <b>Tic Tac Toe</b> bot.\n\n` +
-        `Use <code>/tictactoe</code> in a <b>group</b> to start a game.`
-    );
-});
-
-bot.command("tictactoe", async ctx => {
-    const chat = ctx.chat;
-    const user = ctx.from;
-
-    if (chat.type === "private") {
-        return ctx.reply("❌ This command only works in groups!");
+class TicTacToe {
+    constructor(chatId, creator) {
+        this.gameId = uuidv4();
+        this.chatId = chatId;
+        this.creator = creator;
+        this.board = Array(9).fill(null);
+        this.players = [];
+        this.currentPlayerIndex = 0;
+        this.gameStatus = 'waiting'; // waiting, playing, finished
+        this.winner = null;
     }
 
-    const chatId = chat.id;
-    const userId = user.id;
-    const chatKey = String(chatId);
+    addPlayer(user) {
+        if (this.players.length >= 2) return false;
+        if (this.players.some(p => p.id === user.id)) return false;
+        
+        this.players.push(user);
+        if (this.players.length === 2) {
+            this.gameStatus = 'playing';
+        }
+        return true;
+    }
 
-    // Clear any existing waiting games for this user
-    if (games[chatKey]) {
-        Object.keys(games[chatKey]).forEach(id => {
-            if (games[chatKey][id].players[0] === userId && id.startsWith("game_")) {
-                delete games[chatKey][id];
-            }
+    makeMove(position, playerId) {
+        if (this.gameStatus !== 'playing') return false;
+        if (this.players[this.currentPlayerIndex].id !== playerId) return false;
+        if (this.board[position] !== null) return false;
+        
+        this.board[position] = this.currentPlayerIndex === 0 ? 'X' : 'O';
+        
+        if (this.checkWinner()) {
+            this.gameStatus = 'finished';
+            this.winner = this.players[this.currentPlayerIndex];
+            return true;
+        }
+        
+        if (this.board.every(cell => cell !== null)) {
+            this.gameStatus = 'finished';
+            return true;
+        }
+        
+        this.currentPlayerIndex = 1 - this.currentPlayerIndex;
+        return true;
+    }
+
+    checkWinner() {
+        const winPatterns = [
+            [0, 1, 2], [3, 4, 5], [6, 7, 8], // rows
+            [0, 3, 6], [1, 4, 7], [2, 5, 8], // columns
+            [0, 4, 8], [2, 4, 6]             // diagonals
+        ];
+
+        return winPatterns.some(pattern => {
+            const [a, b, c] = pattern;
+            return this.board[a] !== null && 
+                   this.board[a] === this.board[b] && 
+                   this.board[a] === this.board[c];
         });
     }
 
-    const gameId = initGame(chatId, userId);
-    games[chatKey][gameId].names[userId] = user.first_name;
+    getCurrentPlayer() {
+        return this.players[this.currentPlayerIndex];
+    }
+}
 
-    const message = await ctx.replyWithHTML(
-        `<b>Game Created!</b>\n\n` +
-        `Player <b>X</b>: ${user.first_name}\n\n` +
-        `Waiting for <b>Player O</b> to join...`,
-        Markup.inlineKeyboard([[Markup.button.callback("▶️ Join Game", `join_${chatId}_${gameId}`)]])
-    );
+// Helper functions
+async function sendMessage(chatId, text, replyMarkup = null) {
+    try {
+        await axios.post(`${TELEGRAM_API}/sendMessage`, {
+            chat_id: chatId,
+            text,
+            parse_mode: 'HTML',
+            reply_markup: replyMarkup
+        });
+    } catch (error) {
+        console.error('Error sending message:', error.message);
+    }
+}
 
-    // Store the message ID for later reference
-    games[chatKey][gameId].messageId = message.message_id;
-});
+function formatBoard(board) {
+    const symbols = board.map(cell => cell === null ? ' ' : cell);
+    return `
+${symbols[0]} | ${symbols[1]} | ${symbols[2]}
+---------
+${symbols[3]} | ${symbols[4]} | ${symbols[5]}
+---------
+${symbols[6]} | ${symbols[7]} | ${symbols[8]}
+`;
+}
 
-// Handle join
-bot.action(/^join_(.+)_(.+)/, async ctx => {
-    const [chatIdRaw, gameId] = ctx.match.slice(1);
-    const chatId = String(chatIdRaw);
-    const user = ctx.from;
-    const userId = user.id;
-    const chatKey = String(chatId);
+function getActiveGamesList(chatId) {
+    const gamesList = Array.from(chatGames.get(chatId) || [])
+        .map(gameId => activeGames.get(gameId))
+        .filter(game => game.gameStatus === 'waiting');
+    
+    if (gamesList.length === 0) return null;
+    
+    return gamesList.map(game => ({
+        text: `Join ${game.creator.first_name}'s game`,
+        callback_data: `join_${game.gameId}`
+    }));
+}
 
-    const game = games[chatKey]?.[gameId];
+// Command handlers
+async function handleStart(chatId, from) {
+    await sendMessage(chatId, `🎮 <b>Multi-Game Tic Tac Toe Bot</b> 🎮\n\n` +
+        `Now you can have multiple Tic Tac Toe games running simultaneously in this group!\n\n` +
+        `Use /tictactoe to start a new game\n` +
+        `Use /games to see active games waiting for players`);
+}
+
+async function handleTicTacToe(chatId, from) {
+    const game = new TicTacToe(chatId, from);
+    activeGames.set(game.gameId, game);
+    
+    if (!chatGames.has(chatId)) {
+        chatGames.set(chatId, new Set());
+    }
+    chatGames.get(chatId).add(game.gameId);
+    
+    await sendMessage(chatId, 
+        `🎮 <b>New Tic Tac Toe Game Created by ${from.first_name}</b> 🎮\n\n` +
+        `Game ID: <code>${game.gameId.substring(0, 8)}</code>\n` +
+        `Waiting for a second player to join...`, {
+        inline_keyboard: [[
+            { text: 'Join This Game', callback_data: `join_${game.gameId}` }
+        ]]
+    });
+}
+
+async function handleActiveGames(chatId) {
+    const gamesButtons = getActiveGamesList(chatId);
+    
+    if (!gamesButtons || gamesButtons.length === 0) {
+        await sendMessage(chatId, 'No active games waiting for players. Use /tictactoe to start one!');
+        return;
+    }
+    
+    const chunks = [];
+    for (let i = 0; i < gamesButtons.length; i += 2) {
+        chunks.push(gamesButtons.slice(i, i + 2));
+    }
+    
+    await sendMessage(chatId, '🎮 <b>Active Games Waiting for Players:</b>', {
+        inline_keyboard: chunks
+    });
+}
+
+// Callback handlers
+async function handleJoinGame(chatId, from, gameId) {
+    const game = activeGames.get(gameId);
     
     if (!game) {
-        try {
-            await ctx.answerCbQuery("Game not found or expired.");
-            await ctx.deleteMessage();
-        } catch (e) {
-            console.log("Couldn't delete message:", e.message);
+        await sendMessage(chatId, 'This game no longer exists.');
+        return;
+    }
+    
+    if (game.addPlayer(from)) {
+        if (game.players.length === 2) {
+            await sendMessage(game.chatId, 
+                `🎮 <b>Game Started!</b> 🎮\n` +
+                `Game ID: <code>${game.gameId.substring(0, 8)}</code>\n\n` +
+                `Player 1: ${game.players[0].first_name} (X)\n` +
+                `Player 2: ${game.players[1].first_name} (O)\n\n` +
+                `It's ${game.players[0].first_name}'s turn!`);
+            
+            await sendGameBoard(game);
+        } else {
+            await sendMessage(game.chatId, 
+                `${from.first_name} has joined the game!\n` +
+                `Game ID: <code>${game.gameId.substring(0, 8)}</code>\n` +
+                `Waiting for one more player...`, {
+                inline_keyboard: [[
+                    { text: 'Join This Game', callback_data: `join_${game.gameId}` }
+                ]]
+            });
         }
+    } else {
+        await sendMessage(chatId, 'You cannot join this game (already full or you\'re already in it).');
+    }
+}
+
+async function handleMove(chatId, from, gameId, position) {
+    const game = activeGames.get(gameId);
+    
+    if (!game || game.gameStatus !== 'playing') {
+        await sendMessage(chatId, 'This game is not active.');
         return;
     }
     
-    if (game.players.includes(userId)) {
-        await ctx.answerCbQuery("You already joined.");
-        return;
-    }
-    
-    if (game.players.length >= 2) {
-        await ctx.answerCbQuery("Game is already full.");
-        return;
-    }
-
-    // Add second player
-    game.players.push(userId);
-    game.names[userId] = user.first_name;
-    game.turn = 0; // Reset to first player's turn
-
-    const [p1, p2] = game.players;
-    const nameX = game.names[p1];
-    const nameO = game.names[p2];
-
-    try {
-        // Delete the join message
-        await ctx.deleteMessage();
-        
-        // Send the game board
-        const message = await ctx.telegram.sendMessage(
-            chatId,
-            `<b>Game Started!</b>\n\n` +
-            `Player <b>X</b>: ${nameX}\n` +
-            `Player <b>O</b>: ${nameO}\n\n` +
-            `It's <b>${nameX}</b>'s turn (X)`,
-            {
-                parse_mode: "HTML",
-                reply_markup: generateBoardMarkup(game.board, chatId, gameId).reply_markup
+    if (game.makeMove(parseInt(position), from.id)) {
+        if (game.gameStatus === 'finished') {
+            let message = `🎮 <b>Game Finished!</b> 🎮\n` +
+                         `Game ID: <code>${game.gameId.substring(0, 8)}</code>\n\n`;
+            
+            if (game.winner) {
+                message += `🎉 <b>${game.winner.first_name} wins!</b> 🎉\n\n`;
+            } else {
+                message += `🤝 <b>It's a draw!</b> 🤝\n\n`;
             }
-        );
-        
-        // Store the game board message ID
-        game.messageId = message.message_id;
-        
-        await ctx.answerCbQuery("You joined the game!");
-    } catch (e) {
-        console.log("Error sending game board:", e.message);
-        delete games[chatKey][gameId];
-        await ctx.answerCbQuery("Error starting game. Please try again.");
+            
+            message += formatBoard(game.board);
+            
+            await sendMessage(game.chatId, message);
+            
+            // Clean up
+            activeGames.delete(game.gameId);
+            if (chatGames.has(game.chatId)) {
+                chatGames.get(game.chatId).delete(game.gameId);
+                if (chatGames.get(game.chatId).size === 0) {
+                    chatGames.delete(game.chatId);
+                }
+            }
+        } else {
+            await sendMessage(game.chatId, 
+                `Game ID: <code>${game.gameId.substring(0, 8)}</code>\n` +
+                `${game.getCurrentPlayer().first_name}'s turn (${game.currentPlayerIndex === 0 ? 'X' : 'O'})`);
+            await sendGameBoard(game);
+        }
+    } else {
+        await sendMessage(chatId, 'Invalid move!');
     }
+}
+
+async function sendGameBoard(game) {
+    const boardButtons = [];
+    
+    for (let i = 0; i < 9; i += 3) {
+        const row = [];
+        for (let j = 0; j < 3; j++) {
+            const pos = i + j;
+            const cell = game.board[pos];
+            row.push({
+                text: cell || ' ',
+                callback_data: cell ? `invalid_${game.gameId}` : `move_${game.gameId}_${pos}`
+            });
+        }
+        boardButtons.push(row);
+    }
+    
+    await sendMessage(game.chatId, formatBoard(game.board), {
+        inline_keyboard: boardButtons
+    });
+}
+
+// Webhook handler
+app.post('/webhook', async (req, res) => {
+    const { message, callback_query } = req.body;
+    
+    try {
+        if (message) {
+            const chatId = message.chat.id;
+            const from = message.from;
+            const text = message.text || '';
+            
+            if (text.startsWith('/start')) {
+                await handleStart(chatId, from);
+            } else if (text.startsWith('/tictactoe')) {
+                await handleTicTacToe(chatId, from);
+            } else if (text.startsWith('/games')) {
+                await handleActiveGames(chatId);
+            }
+        } else if (callback_query) {
+            const chatId = callback_query.message.chat.id;
+            const from = callback_query.from;
+            const data = callback_query.data;
+            
+            if (data.startsWith('join_')) {
+                const gameId = data.split('_')[1];
+                await handleJoinGame(chatId, from, gameId);
+            } else if (data.startsWith('move_')) {
+                const [_, gameId, position] = data.split('_');
+                await handleMove(chatId, from, gameId, position);
+            }
+        }
+    } catch (error) {
+        console.error('Error handling update:', error);
+    }
+    
+    res.sendStatus(200);
 });
 
-// Handle moves
-bot.action(/^move_(.+)_(.+)_(\d+)/, async ctx => {
-    const [chatIdRaw, gameId, cellIndexRaw] = ctx.match.slice(1);
-    const chatId = String(chatIdRaw);
-    const cellIndex = parseInt(cellIndexRaw);
-    const userId = ctx.from.id;
-    const chatKey = String(chatId);
-
-    const game = games[chatKey]?.[gameId];
-    if (!game) {
-        try {
-            await ctx.answerCbQuery("Game not found or expired.");
-            await ctx.deleteMessage();
-        } catch (e) {
-            console.log("Couldn't delete message:", e.message);
-        }
-        return;
-    }
-
-    if (userId !== game.players[game.turn]) {
-        await ctx.answerCbQuery("Not your turn!");
-        return;
-    }
-    
-    if (game.board[cellIndex] !== "") {
-        await ctx.answerCbQuery("Already taken!");
-        return;
-    }
-
-    const symbol = getSymbol(game.turn);
-    game.board[cellIndex] = symbol;
-
-    // Check for winner or draw
-    if (checkWinner(game.board, symbol)) {
-        try {
-            await ctx.editMessageText(
-                `<b>🎉 Player ${symbol} (${game.names[userId]}) wins!</b>\n\n` +
-                `Player <b>X</b>: ${game.names[game.players[0]]}\n` +
-                `Player <b>O</b>: ${game.names[game.players[1]]}`,
-                { 
-                    parse_mode: "HTML",
-                    reply_markup: generateBoardMarkup(game.board, chatId, gameId).reply_markup
-                }
-            );
-            delete games[chatKey][gameId];
-            await ctx.answerCbQuery(`Player ${symbol} wins!`);
-        } catch (e) {
-            console.log("Error updating win message:", e.message);
-        }
-        return;
-    }
-
-    if (isDraw(game.board)) {
-        try {
-            await ctx.editMessageText(
-                `<b>🤝 It's a draw!</b>\n\n` +
-                `Player <b>X</b>: ${game.names[game.players[0]]}\n` +
-                `Player <b>O</b>: ${game.names[game.players[1]]}`,
-                { 
-                    parse_mode: "HTML",
-                    reply_markup: generateBoardMarkup(game.board, chatId, gameId).reply_markup
-                }
-            );
-            delete games[chatKey][gameId];
-            await ctx.answerCbQuery("Game ended in a draw!");
-        } catch (e) {
-            console.log("Error updating draw message:", e.message);
-        }
-        return;
-    }
-
-    // Switch turns
-    game.turn = 1 - game.turn;
-    const nextPlayerId = game.players[game.turn];
-    const nextName = game.names[nextPlayerId];
-    const nextSymbol = getSymbol(game.turn);
-
+// Set webhook
+async function setWebhook() {
     try {
-        await ctx.editMessageText(
-            `It's <b>${nextName}</b>'s turn (${nextSymbol})\n\n` +
-            `Player <b>X</b>: ${game.names[game.players[0]]}\n` +
-            `Player <b>O</b>: ${game.names[game.players[1]]}`,
-            {
-                parse_mode: "HTML",
-                reply_markup: generateBoardMarkup(game.board, chatId, gameId).reply_markup
-            }
-        );
-        await ctx.answerCbQuery(`You placed ${symbol}`);
-    } catch (e) {
-        console.log("Error updating game board:", e.message);
-        await ctx.answerCbQuery("Error updating game. Please try again.");
+        const webhookUrl = process.env.WEBHOOK_URL;
+        const response = await axios.get(`${TELEGRAM_API}/setWebhook?url=${webhookUrl}/webhook`);
+        console.log('Webhook set:', response.data);
+    } catch (error) {
+        console.error('Error setting webhook:', error.message);
+    }
+}
+
+// Start server
+app.listen(PORT, async () => {
+    console.log(`Server running on port ${PORT}`);
+    if (TELEGRAM_TOKEN && process.env.WEBHOOK_URL) {
+        await setWebhook();
     }
 });
-
-// Clean up expired games periodically (30 minutes)
-setInterval(() => {
-    const now = Date.now();
-    for (const chatId in games) {
-        for (const gameId in games[chatId]) {
-            const game = games[chatId][gameId];
-            // Remove games older than 30 minutes
-            if (now - game.createdAt > 30 * 60 * 1000) {
-                delete games[chatId][gameId];
-            }
-        }
-        // If no games left in chat, remove the chat entry
-        if (Object.keys(games[chatId]).length === 0) {
-            delete games[chatId];
-        }
-    }
-}, 5 * 60 * 1000); // Check every 5 minutes
-
-bot.launch();
