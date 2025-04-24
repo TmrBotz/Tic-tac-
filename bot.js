@@ -1,120 +1,172 @@
-const { Telegraf, Markup } = require('telegraf');
-const express = require('express');
-const app = express();
+const { Telegraf, Markup } = require("telegraf");
 
-const bot = new Telegraf('7473136514:AAHo9JfF8Be1qLmbrCiopjT5WhpWxBQABCU');
-const games = {}; // Stores game state per game ID (chatID + messageID)
+const bot = new Telegraf("7473136514:AAHo9JfF8Be1qLmbrCiopjT5WhpWxBQABCU");
 
-function generateBoard(board, gameId) {
-  return Markup.inlineKeyboard(
-    board.map((cell, i) =>
-      Markup.button.callback(cell || '⬜', `${gameId}:${i}`)
-    , 3)
-  );
-}
+// Game state per chat
+const games = {};
+const symbols = ["X", "O"];
 
 function createEmptyBoard() {
-  return Array(9).fill('');
+  return Array(9).fill(" ");
 }
 
-function checkWinner(board, symbol) {
-  const win = [
+function getSymbol(turn) {
+  return symbols[turn % 2];
+}
+
+function checkWinner(board) {
+  const winPatterns = [
     [0, 1, 2], [3, 4, 5], [6, 7, 8],
     [0, 3, 6], [1, 4, 7], [2, 5, 8],
-    [0, 4, 8], [2, 4, 6],
+    [0, 4, 8], [2, 4, 6]
   ];
-  return win.some(comb => comb.every(i => board[i] === symbol));
+  for (const [a, b, c] of winPatterns) {
+    if (board[a] !== " " && board[a] === board[b] && board[a] === board[c]) {
+      return board[a];
+    }
+  }
+  return null;
 }
 
-function isFull(board) {
-  return board.every(cell => cell !== '');
+function isDraw(board) {
+  return board.every(cell => cell !== " ");
 }
 
-bot.start(ctx => {
-  ctx.replyWithHTML(`<b>Welcome!</b>\nUse /tictactoe to start a game in a group.`);
+function generateBoardMarkup(board, chatId) {
+  const buttons = [];
+  for (let i = 0; i < 3; i++) {
+    const row = [];
+    for (let j = 0; j < 3; j++) {
+      const index = i * 3 + j;
+      row.push(Markup.button.callback(board[index], `move_${chatId}_${index}`));
+    }
+    buttons.push(row);
+  }
+  return Markup.inlineKeyboard(buttons);
+}
+
+bot.start((ctx) => {
+  ctx.reply(
+    `<b>Welcome to Tic Tac Toe Bot!</b>\n\nUse <code>/tictactoe</code> in a group to start a game.`,
+    { parse_mode: "HTML" }
+  );
 });
 
-bot.command('tictactoe', async (ctx) => {
-  if (ctx.chat.type === 'private') return ctx.reply('Use this command in a group chat.');
-  
-  const chatId = ctx.chat.id;
-  const message = await ctx.replyWithHTML(`<b>Waiting for another player...</b>`, {
-    reply_markup: Markup.inlineKeyboard([
-      [Markup.button.callback('Join Game', `join:${chatId}:${ctx.from.id}`)]
-    ])
-  });
-  
-  const gameId = `${chatId}:${message.message_id}`;
-  games[gameId] = {
-    board: createEmptyBoard(),
-    players: [ctx.from.id],
-    turn: 0,
-    message_id: message.message_id
-  };
-});
-
-bot.on('callback_query', async (ctx) => {
-  const data = ctx.callbackQuery.data;
-
-  if (data.startsWith('join:')) {
-    const [_, chatId, player1] = data.split(':');
-    const gameId = `${chatId}:${ctx.callbackQuery.message.message_id}`;
-    const game = games[gameId];
-
-    if (!game || game.players.length === 2) {
-      return ctx.answerCbQuery('Game already started or not available.');
-    }
-
-    if (ctx.from.id == player1) {
-      return ctx.answerCbQuery('You cannot join your own game.');
-    }
-
-    game.players.push(ctx.from.id);
-
-    await ctx.editMessageText(
-      `Game Started!\n${ctx.from.first_name} vs ${ctx.from.id == game.players[0] ? 'You' : 'Opponent'}`,
-      generateBoard(game.board, gameId)
-    );
-
-  } else if (data.includes(':')) {
-    const [gameId, index] = data.split(':');
-    const game = games[gameId];
-
-    if (!game || game.players.length < 2) {
-      return ctx.answerCbQuery('Game not started.');
-    }
-
-    const userId = ctx.from.id;
-    if (userId !== game.players[game.turn]) {
-      return ctx.answerCbQuery('Not your turn!');
-    }
-
-    if (game.board[index] !== '') {
-      return ctx.answerCbQuery('Already taken!');
-    }
-
-    const symbol = game.turn === 0 ? '❌' : '⭕';
-    game.board[index] = symbol;
-
-    if (checkWinner(game.board, symbol)) {
-      await ctx.editMessageText(
-        `🏆 ${ctx.from.first_name} wins!`,
-        generateBoard(game.board, gameId)
-      );
-      delete games[gameId];
-      return;
-    }
-
-    if (isFull(game.board)) {
-      await ctx.editMessageText('It\'s a draw!', generateBoard(game.board, gameId));
-      delete games[gameId];
-      return;
-    }
-
-    game.turn = 1 - game.turn;
-
-    await ctx.editMessageReplyMarkup(generateBoard(game.board, gameId).reply_markup);
+bot.command("tictactoe", async (ctx) => {
+  if (ctx.chat.type === "private") {
+    return ctx.reply("Please use this command in a group.");
   }
 
-  ctx.answerCbQuery();
+  const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+  const name = ctx.from.first_name;
+
+  if (games[chatId]) {
+    return ctx.reply("A game is already in progress in this group.");
+  }
+
+  games[chatId] = {
+    board: createEmptyBoard(),
+    players: [userId],
+    names: { [userId]: name },
+    turn: 0,
+    joined: false,
+    messageId: null
+  };
+
+  const joinBtn = Markup.inlineKeyboard([
+    Markup.button.callback("Join Game", `join_${chatId}`)
+  ]);
+
+  const message = await ctx.reply(
+    `<b>${name}</b> started a new game!\n\nWaiting for a second player to join...`,
+    {
+      reply_markup: joinBtn.reply_markup,
+      parse_mode: "HTML"
+    }
+  );
+
+  games[chatId].messageId = message.message_id;
 });
+
+bot.action(/join_(.+)/, async (ctx) => {
+  const chatId = Number(ctx.match[1]);
+  const userId = ctx.from.id;
+  const name = ctx.from.first_name;
+  const game = games[chatId];
+
+  if (!game || game.players.length >= 2 || game.joined) {
+    return ctx.answerCbQuery("You cannot join this game.");
+  }
+
+  if (game.players.includes(userId)) {
+    return ctx.answerCbQuery("You already joined.");
+  }
+
+  game.players.push(userId);
+  game.names[userId] = name;
+  game.joined = true;
+
+  const [playerX, playerO] = game.players.map(id => game.names[id]);
+  const symbolX = symbols[0];
+
+  await ctx.editMessageText(
+    `<b>Game Started!</b>\n\n<b>Player X:</b> ${playerX}\n<b>Player O:</b> ${playerO}\n\n<i>${playerX}'s turn (${symbolX})</i>`,
+    {
+      reply_markup: generateBoardMarkup(game.board, chatId).reply_markup,
+      parse_mode: "HTML"
+    }
+  );
+});
+
+bot.action(/move_(.+)_(\d+)/, async (ctx) => {
+  const chatId = Number(ctx.match[1]);
+  const index = Number(ctx.match[2]);
+  const userId = ctx.from.id;
+  const game = games[chatId];
+
+  if (!game || !game.joined || game.players.length < 2) {
+    return ctx.answerCbQuery("No active game.");
+  }
+
+  if (game.board[index] !== " ") {
+    return ctx.answerCbQuery("That spot is already taken.");
+  }
+
+  const currentPlayerId = game.players[game.turn % 2];
+  if (userId !== currentPlayerId) {
+    return ctx.answerCbQuery("It's not your turn.");
+  }
+
+  const symbol = getSymbol(game.turn);
+  game.board[index] = symbol;
+  game.turn++;
+
+  const winner = checkWinner(game.board);
+  const nextPlayerId = game.players[game.turn % 2];
+
+  if (winner) {
+    await ctx.editMessageText(
+      `<b>Player ${symbol} (${game.names[userId]}) wins!</b>`,
+      { parse_mode: "HTML" }
+    );
+    delete games[chatId];
+    return;
+  }
+
+  if (isDraw(game.board)) {
+    await ctx.editMessageText(`<b>It's a draw!</b>`, { parse_mode: "HTML" });
+    delete games[chatId];
+    return;
+  }
+
+  await ctx.editMessageText(
+    `<i>It's ${game.names[nextPlayerId]}'s turn (${getSymbol(game.turn)})</i>`,
+    {
+      reply_markup: generateBoardMarkup(game.board, chatId).reply_markup,
+      parse_mode: "HTML"
+    }
+  );
+});
+
+bot.launch();
