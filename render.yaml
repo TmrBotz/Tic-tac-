@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: tictactoe-bot
-    env: node
-    plan: free
-    buildCommand: npm install
-    startCommand: node bot.js
